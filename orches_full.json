@@ -1,0 +1,971 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": 11,
+  "links": [],
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 5,
+      "panels": [],
+      "title": "Job Summary per Day",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "dfbbnkjf9lhc0c"
+      },
+      "gridPos": {
+        "h": 16,
+        "w": 18,
+        "x": 0,
+        "y": 1
+      },
+      "id": 1,
+      "options": {
+        "edges": {},
+        "nodes": {}
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "dfbbnkjf9lhc0c"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH RECURSIVE\ndbt_job_id as (\n    select id, depend_ons from olap_dev.job_config\n),\nall_raw_ids as (\n  SELECT\n      distinct elem as id\n  FROM olap_dev.job_config jc\n  LEFT JOIN LATERAL jsonb_array_elements_text(\n      CASE\n          WHEN jsonb_typeof(jc.depend_ons) = 'array'\n          THEN jc.depend_ons\n          ELSE '[]'::jsonb\n      END\n  ) AS elem ON TRUE\n  where elem not in (select id from dbt_job_id)\n),\nall_config_ids as (\n    select id, '[]'::jsonb AS depend_ons from all_raw_ids\n    union all\n    select id, depend_ons from dbt_job_id\n),\ndownstream AS (\n    -- level 0: job gốc\n    SELECT \n        id,\n        0 AS level\n    FROM all_config_ids\n    WHERE ('All' IN ($job_id) OR id IN ($job_id))\n\n    UNION ALL\n\n    -- level n: job downstream\n    SELECT \n        c.id,\n        d.level + 1 AS level\n    FROM olap_dev.job_config c\n    JOIN downstream d \n        ON c.depend_ons ? d.id\n    WHERE d.level < $level \n),\nupstream AS (\n    -- level 0: job gốc\n    SELECT \n        id,\n        depend_ons,\n        0 AS level\n    FROM all_config_ids\n    WHERE ('All' IN ($job_id ) OR id IN ($job_id ))\n\n    UNION ALL\n\n    -- level n: job upstream\n    SELECT \n        c.id,\n        c.depend_ons,\n        u.level + 1 AS level\n    FROM all_config_ids c\n    JOIN upstream u \n        ON u.depend_ons ? c.id\n    WHERE u.level < $level\n),\nall_logs as (\n    select job_id, data_date, status from olap_dev.execution_log \n    union all\n    select data_source_name as job_id, data_date, status from olap_dev.glue_catalog_ingestion_tracking\n),\nall_ids AS (\n    SELECT id\n    FROM downstream\n    WHERE level <= $level\n    UNION\n    SELECT id\n    FROM upstream\n    WHERE level <= $level\n)\nSELECT DISTINCT ON (conf.id)\n    conf.id AS id,\n    conf.id AS title,\n    COALESCE(log.status, 'NOT_STARTED') AS \"mainStat\",\n    CASE \n        WHEN log.status = 'Completed' THEN 'green'\n        WHEN log.status = 'SUCCESS' THEN 'green'\n        WHEN log.status = 'FAILED' THEN 'red'\n        WHEN log.status = 'RUNNING' THEN 'blue'\n        WHEN log.status = 'PENDING' THEN 'orange'\n        WHEN log.status = 'QUEUE' THEN 'purple'\n        ELSE 'gray' \n    END AS color\nFROM all_config_ids conf\nLEFT JOIN all_logs log \n    ON conf.id = log.job_id \n   AND ('All' IN ($data_date) OR log.data_date::text IN ($data_date))\nWHERE conf.id IN (SELECT id FROM all_ids);\n",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        },
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "dfbbnkjf9lhc0c"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "hide": false,
+          "rawQuery": true,
+          "rawSql": "WITH RECURSIVE\ndbt_job_id as (\n    select id, depend_ons from olap_dev.job_config\n),\nall_raw_ids as (\n  SELECT\n      distinct elem as id\n  FROM olap_dev.job_config jc\n  LEFT JOIN LATERAL jsonb_array_elements_text(\n      CASE\n          WHEN jsonb_typeof(jc.depend_ons) = 'array'\n          THEN jc.depend_ons\n          ELSE '[]'::jsonb\n      END\n  ) AS elem ON TRUE\n  where elem not in (select id from dbt_job_id)\n),\nall_config_ids as (\n    select id, '[]'::jsonb AS depend_ons from all_raw_ids\n    union all\n    select id, depend_ons from dbt_job_id\n),\ndownstream AS (\n    -- level 0: job gốc\n    SELECT \n        id,\n        0 AS level\n    FROM all_config_ids\n    WHERE ('All' IN ($job_id) OR id IN ($job_id))\n\n    UNION ALL\n\n    -- downstream level n\n    SELECT \n        c.id,\n        d.level + 1 AS level\n    FROM all_config_ids c\n    JOIN downstream d \n        ON c.depend_ons ? d.id\n    WHERE d.level < $level\n),\nupstream AS (\n    -- level 0: job gốc\n    SELECT \n        id,\n        depend_ons,\n        0 AS level\n    FROM all_config_ids\n    WHERE ('All' IN ($job_id) OR id IN ($job_id))\n\n    UNION ALL\n\n    -- upstream level n\n    SELECT \n        c.id,\n        c.depend_ons,\n        u.level + 1 AS level\n    FROM all_config_ids c\n    JOIN upstream u \n        ON u.depend_ons ? c.id\n    WHERE u.level < $level\n),\nall_ids AS (\n    -- filter theo level\n    SELECT id FROM downstream WHERE level <= $level\n    UNION\n    SELECT id FROM upstream WHERE level <= $level\n)\nSELECT \n    parent_id || '->' || child_id AS id,\n    parent_id AS source,\n    child_id AS target\nFROM (\n    SELECT \n        jsonb_array_elements_text(\n            CASE \n                WHEN jsonb_typeof(depend_ons) = 'array' \n                THEN depend_ons \n                ELSE '[]'::jsonb \n            END\n        ) AS parent_id,\n        id AS child_id\n    FROM all_config_ids\n) all_links\nWHERE parent_id IN (SELECT id FROM all_ids)\n  AND child_id IN (SELECT id FROM all_ids);\n",
+          "refId": "B",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "Job Full Layer",
+      "type": "nodeGraph"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "dfbbnkjf9lhc0c"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 3,
+        "x": 18,
+        "y": 1
+      },
+      "id": 8,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "10.4.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "dfbbnkjf9lhc0c"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "select count(1)\r\nfrom olap_dev.job_config",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "Total DBT Job",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "dfbbnkjf9lhc0c"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 3,
+        "x": 21,
+        "y": 1
+      },
+      "id": 9,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "10.4.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "dfbbnkjf9lhc0c"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "with dbt_job_id as (\r\n    select id from olap_dev.job_config\r\n)\r\nSELECT\r\n    count (distinct elem)\r\nFROM olap_dev.job_config jc\r\nLEFT JOIN LATERAL jsonb_array_elements_text(\r\n    CASE\r\n        WHEN jsonb_typeof(jc.depend_ons) = 'array'\r\n        THEN jc.depend_ons\r\n        ELSE '[]'::jsonb\r\n    END\r\n) AS elem ON TRUE\r\nwhere elem not in (select id from dbt_job_id);\r\n",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "Total Raw Jobs",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "dfbbnkjf9lhc0c"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "dark-red",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 3,
+        "x": 18,
+        "y": 4
+      },
+      "id": 11,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "10.4.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "dfbbnkjf9lhc0c"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH\r\ndbt_job_id as (\r\n    select id from olap_dev.job_config\r\n),\r\ntotal_job AS (\r\n    SELECT COUNT(1) AS total_job\r\n    FROM olap_dev.job_config\r\n),\r\ntotal_job_run AS (\r\n    SELECT COUNT(1) AS total_job_run\r\n    FROM olap_dev.execution_log log\r\n    WHERE log.data_date::text IN ($data_date)\r\n    and job_id in (select id from dbt_job_id)\r\n)\r\nSELECT\r\n    total_job.total_job - total_job_run.total_job_run AS not_run_job\r\nFROM total_job, total_job_run;\r\n",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "Total DBT Jobs not run",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "dfbbnkjf9lhc0c"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "dark-red",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 3,
+        "x": 21,
+        "y": 4
+      },
+      "id": 12,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "10.4.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "dfbbnkjf9lhc0c"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH dbt_job_id AS (\r\n    SELECT id\r\n    FROM olap_dev.job_config\r\n),\r\nraw_job_id AS (\r\n    -- các dependency KHÔNG tồn tại trong job_config\r\n    SELECT DISTINCT elem\r\n    FROM olap_dev.job_config jc\r\n    LEFT JOIN LATERAL jsonb_array_elements_text(\r\n        CASE\r\n            WHEN jsonb_typeof(jc.depend_ons) = 'array'\r\n            THEN jc.depend_ons\r\n            ELSE '[]'::jsonb\r\n        END\r\n    ) AS elem ON TRUE\r\n    WHERE elem IS NOT NULL\r\n      AND NOT EXISTS (\r\n          SELECT 1\r\n          FROM dbt_job_id d\r\n          WHERE d.id = elem\r\n      )\r\n),\r\nraw_job_total_count AS (\r\n    SELECT COUNT(*) AS total_raw_job\r\n    FROM raw_job_id\r\n),\r\ncount_job_run AS (\r\n    SELECT COUNT(DISTINCT log.data_source_name) AS total_run\r\n    FROM olap_dev.glue_catalog_ingestion_tracking log\r\n    WHERE log.data_date::text IN ($data_date)\r\n      AND log.data_source_name IN (SELECT elem FROM raw_job_id)\r\n)\r\nSELECT\r\n    r.total_raw_job - c.total_run AS not_run_raw_job\r\nFROM raw_job_total_count r\r\nCROSS JOIN count_job_run c;\r\n",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "Total Raw Jobs not run",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "dfbbnkjf9lhc0c"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 7
+      },
+      "id": 10,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "10.4.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "dfbbnkjf9lhc0c"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "with dbt_job_id as (\r\n    select id from olap_dev.job_config\r\n),\r\nraw_job_id as (\r\nSELECT\r\n    distinct elem\r\nFROM olap_dev.job_config jc\r\nLEFT JOIN LATERAL jsonb_array_elements_text(\r\n    CASE\r\n        WHEN jsonb_typeof(jc.depend_ons) = 'array'\r\n        THEN jc.depend_ons\r\n        ELSE '[]'::jsonb\r\n    END\r\n) AS elem ON TRUE\r\nwhere elem not in (select id from dbt_job_id)\r\n)\r\nSELECT status as \"Job Status\", count(1) as \"Job Count\" FROM olap_dev.glue_catalog_ingestion_tracking log\r\nwhere \r\n  log.data_date::text IN ($data_date)\r\n  and log.data_source_name in (select elem from raw_job_id)\r\ngroup by status",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "Total Job Raw per Day",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "dfbbnkjf9lhc0c"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 12
+      },
+      "id": 4,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "10.4.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "dfbbnkjf9lhc0c"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "with dbt_job_id as (\r\n    select id from olap_dev.job_config\r\n)\r\nSELECT status as \"Job Status\", count(1) as \"Job Count\" FROM olap_dev.execution_log log\r\nwhere \r\n  log.data_date::text IN ($data_date)\r\n  and job_id in (select id from dbt_job_id)\r\ngroup by status",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "Total Job DBT per Day",
+      "type": "table"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 17
+      },
+      "id": 6,
+      "panels": [],
+      "title": "Job Dependencies",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "dfbbnkjf9lhc0c"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "depend_ons"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 2018
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "id": 3,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true,
+        "sortBy": []
+      },
+      "pluginVersion": "10.4.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "dfbbnkjf9lhc0c"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH RECURSIVE \ndownstream AS (\n    -- FIXED: Removed hardcoded 'cron-monitoring...' replaced with variable\n    SELECT id FROM olap_dev.job_config WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION\n    SELECT c.id \n    FROM olap_dev.job_config c\n    JOIN downstream d ON c.depend_ons ? d.id\n),\nupstream AS (\n    SELECT id, depend_ons FROM olap_dev.job_config WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION\n    SELECT c.id, c.depend_ons\n    FROM olap_dev.job_config c\n    JOIN upstream u ON u.depend_ons ? c.id\n),\nall_ids AS (\n    SELECT id FROM downstream\n    UNION\n    SELECT id FROM upstream\n)\nSELECT \n    execution_id,\n    job_id,\n    data_date::text,\n    depend_ons,\n    dependency_status,\n    job_config,\n    status,\n    detail_status,\n    error_message,\n    max_retry,\n    retry,\n    start_time::text,\n    end_time::text,\n    data_date_type,\n    duration,\n    cron_expression,\n    run_dependencies,\n    schedule_type,\n    log_retention_days,\n    engine_run_id,\n    redshift_write_status,\n    redshift_write_result,\n    execution_steps,\n    test_results,\n    test_status\nFROM olap_dev.execution_log log\nWHERE log.job_id IN (SELECT id FROM all_ids) \n  AND ('All' IN ($data_date) OR log.data_date::text IN ($data_date))\n  AND (\n    'All' IN ($status)\n    OR log.status IN ($status)\n)\n",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "Execution Log",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "dfbbnkjf9lhc0c"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "id": 2,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "10.4.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "dfbbnkjf9lhc0c"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "WITH RECURSIVE \ndownstream AS (\n    -- FIXED: Used standardized variable syntax\n    SELECT id FROM olap_dev.job_config WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION\n    SELECT c.id \n    FROM olap_dev.job_config c\n    JOIN downstream d ON c.depend_ons ? d.id\n),\nupstream AS (\n    SELECT id, depend_ons FROM olap_dev.job_config WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION\n    SELECT c.id, c.depend_ons\n    FROM olap_dev.job_config c\n    JOIN upstream u ON u.depend_ons ? c.id\n),\nall_ids AS (\n    SELECT id FROM downstream\n    UNION\n    SELECT id FROM upstream\n)\nSELECT * FROM olap_dev.job_config conf\nWHERE conf.id IN (SELECT id FROM all_ids);",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "Job Config",
+      "type": "table"
+    }
+  ],
+  "refresh": "",
+  "schemaVersion": 39,
+  "tags": [
+    "Orches"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "selected": true,
+          "text": [
+            "ar_loan_contract"
+          ],
+          "value": [
+            "ar_loan_contract"
+          ]
+        },
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "dfbbnkjf9lhc0c"
+        },
+        "definition": "select id from olap_dev.job_config;",
+        "description": "",
+        "hide": 0,
+        "includeAll": false,
+        "multi": true,
+        "name": "job_id",
+        "options": [],
+        "query": "select id from olap_dev.job_config;",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": false,
+          "text": "2026-01-12",
+          "value": "2026-01-12"
+        },
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "dfbbnkjf9lhc0c"
+        },
+        "definition": "\nselect data_date::text from olap_dev.execution_log o;",
+        "description": "",
+        "hide": 0,
+        "includeAll": true,
+        "multi": false,
+        "name": "data_date",
+        "options": [],
+        "query": "\nselect data_date::text from olap_dev.execution_log o;",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 2,
+        "type": "query"
+      },
+      {
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "dfbbnkjf9lhc0c"
+        },
+        "definition": "select distinct status::text from olap_dev.execution_log\nUNION ALL\nselect 'NOT_STARTED' as status;",
+        "hide": 0,
+        "includeAll": true,
+        "multi": true,
+        "name": "status",
+        "options": [],
+        "query": "select distinct status::text from olap_dev.execution_log\nUNION ALL\nselect 'NOT_STARTED' as status;",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "auto": false,
+        "auto_count": 30,
+        "auto_min": "10s",
+        "current": {
+          "selected": false,
+          "text": "1",
+          "value": "1"
+        },
+        "hide": 0,
+        "label": "Level",
+        "name": "level",
+        "options": [
+          {
+            "selected": true,
+            "text": "1",
+            "value": "1"
+          },
+          {
+            "selected": false,
+            "text": "2",
+            "value": "2"
+          },
+          {
+            "selected": false,
+            "text": "3",
+            "value": "3"
+          },
+          {
+            "selected": false,
+            "text": "4",
+            "value": "4"
+          },
+          {
+            "selected": false,
+            "text": "5",
+            "value": "5"
+          },
+          {
+            "selected": false,
+            "text": "6",
+            "value": "6"
+          },
+          {
+            "selected": false,
+            "text": "7",
+            "value": "7"
+          },
+          {
+            "selected": false,
+            "text": "8",
+            "value": "8"
+          }
+        ],
+        "query": "1,2,3,4,5,6,7,8",
+        "queryValue": "",
+        "refresh": 2,
+        "skipUrlSync": false,
+        "type": "interval"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "timepicker": {
+    "hidden": true
+  },
+  "timezone": "browser",
+  "title": "Orches Full Layer",
+  "uid": "afagos32k5wjkc",
+  "version": 27,
+  "weekStart": ""
+}
