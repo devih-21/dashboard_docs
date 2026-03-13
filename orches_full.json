@@ -59,7 +59,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "WITH RECURSIVE\ndbt_job_id as (\n    select id, depend_ons from olap_dev.job_config\n),\nall_raw_ids as (\n  SELECT\n      distinct elem as id\n  FROM olap_dev.job_config jc\n  LEFT JOIN LATERAL jsonb_array_elements_text(\n      CASE\n          WHEN jsonb_typeof(jc.depend_ons) = 'array'\n          THEN jc.depend_ons\n          ELSE '[]'::jsonb\n      END\n  ) AS elem ON TRUE\n  where elem not in (select id from dbt_job_id)\n),\nall_config_ids as (\n    select id, '[]'::jsonb AS depend_ons from all_raw_ids\n    union all\n    select id, depend_ons from dbt_job_id\n),\ndownstream AS (\n    -- level 0: job gốc\n    SELECT \n        id,\n        0 AS level\n    FROM all_config_ids\n    WHERE ('All' IN ($job_id) OR id IN ($job_id))\n\n    UNION ALL\n\n    -- level n: job downstream\n    SELECT \n        c.id,\n        d.level + 1 AS level\n    FROM olap_dev.job_config c\n    JOIN downstream d \n        ON c.depend_ons ? d.id\n    WHERE d.level < $level \n),\nupstream AS (\n    -- level 0: job gốc\n    SELECT \n        id,\n        depend_ons,\n        0 AS level\n    FROM all_config_ids\n    WHERE ('All' IN ($job_id ) OR id IN ($job_id ))\n\n    UNION ALL\n\n    -- level n: job upstream\n    SELECT \n        c.id,\n        c.depend_ons,\n        u.level + 1 AS level\n    FROM all_config_ids c\n    JOIN upstream u \n        ON u.depend_ons ? c.id\n    WHERE u.level < $level\n),\nall_logs as (\n    select job_id, data_date, status from olap_dev.execution_log \n    union all\n    select data_source_name as job_id, data_date, status from olap_dev.glue_catalog_ingestion_tracking\n),\nall_ids AS (\n    SELECT id\n    FROM downstream\n    WHERE level <= $level\n    UNION\n    SELECT id\n    FROM upstream\n    WHERE level <= $level\n)\nSELECT DISTINCT ON (conf.id)\n    conf.id AS id,\n    conf.id AS title,\n    COALESCE(log.status, 'NOT_STARTED') AS \"mainStat\",\n    CASE \n        WHEN log.status = 'Completed' THEN 'green'\n        WHEN log.status = 'SUCCESS' THEN 'green'\n        WHEN log.status = 'FAILED' THEN 'red'\n        WHEN log.status = 'RUNNING' THEN 'blue'\n        WHEN log.status = 'PENDING' THEN 'orange'\n        WHEN log.status = 'QUEUE' THEN 'purple'\n        ELSE 'gray' \n    END AS color\nFROM all_config_ids conf\nLEFT JOIN all_logs log \n    ON conf.id = log.job_id \n   AND ('All' IN ($data_date) OR log.data_date::text IN ($data_date))\nWHERE conf.id IN (SELECT id FROM all_ids);\n",
+          "rawSql": "WITH RECURSIVE\ndbt_job_id as (\n    -- Bước 1: Lấy thêm layer từ config\n    select id, depend_ons, layer from olap_orchestration.job_config\n),\nall_raw_ids as (\n  SELECT\n      distinct elem as id,\n      'raw' as layer -- Bước 2: Gán nhãn 'raw' cho các id ngoại lai\n  FROM olap_orchestration.job_config jc\n  LEFT JOIN LATERAL jsonb_array_elements_text(\n      CASE\n          WHEN jsonb_typeof(jc.depend_ons) = 'array'\n          THEN jc.depend_ons\n          ELSE '[]'::jsonb\n      END\n  ) AS elem ON TRUE\n  where elem not in (select id from dbt_job_id)\n),\nall_config_ids as (\n    -- Bước 3: Hợp nhất layer vào danh sách ID\n    select id, '[]'::jsonb AS depend_ons, layer from all_raw_ids\n    union all\n    select id, depend_ons, layer from dbt_job_id\n),\ndownstream AS (\n    SELECT \n        id,\n        0 AS level\n    FROM all_config_ids\n    WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION ALL\n    SELECT \n        c.id,\n        d.level + 1 AS level\n    FROM olap_orchestration.job_config c\n    JOIN downstream d ON c.depend_ons ? d.id\n    WHERE d.level < $level \n),\nupstream AS (\n    SELECT \n        id,\n        depend_ons,\n        0 AS level\n    FROM all_config_ids\n    WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION ALL\n    SELECT \n        c.id,\n        c.depend_ons,\n        u.level + 1 AS level\n    FROM all_config_ids c\n    JOIN upstream u ON u.depend_ons ? c.id\n    WHERE u.level < $level\n),\nall_logs as (\n    select \n        job_id, \n        data_date, \n        status,\n        start_time,\n        end_time,\n        layer\n    from olap_orchestration.execution_log \n    union all\n    select \n        data_source_name as job_id, \n        data_date, \n        status,\n        created_at as start_time,\n        updated_at as end_time,\n        'raw' as layer\n    from olap_orchestration.glue_catalog_ingestion_tracking\n),\nall_ids AS (\n    SELECT id FROM downstream WHERE level <= $level\n    UNION\n    SELECT id FROM upstream WHERE level <= $level\n)\nSELECT DISTINCT ON (conf.id)\n    conf.id AS id,\n    conf.id AS title,\n    -- Ưu tiên layer từ config, nếu log không có thì lấy từ config\n    'Layer: ' || COALESCE(conf.layer, log.layer, 'N/A') as subtitle,\n    COALESCE(log.status, 'NO_LOG') AS \"mainStat\",\n    CASE \n        WHEN log.status IN ('Completed', 'SUCCESS') THEN 'green'\n        WHEN log.status = 'FAILED' THEN 'red'\n        WHEN log.status = 'RUNNING' THEN 'blue'\n        WHEN log.status = 'PENDING' THEN 'orange'\n        WHEN log.status = 'QUEUE' THEN 'purple'\n        ELSE 'gray' \n    END AS color,\n    -- Metadata chi tiết\n    COALESCE(TO_CHAR(log.start_time, 'HH24:MI:SS'), 'N/A')::text AS \"detail__start_time\",\n    COALESCE(TO_CHAR(log.end_time, 'HH24:MI:SS'), 'N/A')::text AS \"detail__end_time\",\n    COALESCE(\n        (EXTRACT(EPOCH FROM (log.end_time - log.start_time))::int)::text || 's',\n        'N/A'\n    )::text AS \"detail__duration\",\n    COALESCE(log.status, 'NO_LOG') AS \"detail__status\",\n    COALESCE(log.data_date::text, 'N/A') AS \"detail__data_date\",\n    COALESCE(conf.layer, log.layer, 'N/A')::text AS \"detail__layer\",\n    conf.id AS \"detail__job_id\"\nFROM all_config_ids conf\nLEFT JOIN all_logs log \n    ON conf.id = log.job_id \n   AND ('All' IN ($data_date) OR log.data_date::text IN ($data_date))\nWHERE conf.id IN (SELECT id FROM all_ids)\n-- Thêm filter layer nếu bạn có biến $layer trên Grafana\nAND ('All' IN ($layer) OR conf.layer IN ($layer)) \nORDER BY conf.id, log.start_time DESC NULLS LAST;",
           "refId": "A",
           "sql": {
             "columns": [
@@ -88,7 +88,7 @@
           "format": "table",
           "hide": false,
           "rawQuery": true,
-          "rawSql": "WITH RECURSIVE\ndbt_job_id as (\n    select id, depend_ons from olap_dev.job_config\n),\nall_raw_ids as (\n  SELECT\n      distinct elem as id\n  FROM olap_dev.job_config jc\n  LEFT JOIN LATERAL jsonb_array_elements_text(\n      CASE\n          WHEN jsonb_typeof(jc.depend_ons) = 'array'\n          THEN jc.depend_ons\n          ELSE '[]'::jsonb\n      END\n  ) AS elem ON TRUE\n  where elem not in (select id from dbt_job_id)\n),\nall_config_ids as (\n    select id, '[]'::jsonb AS depend_ons from all_raw_ids\n    union all\n    select id, depend_ons from dbt_job_id\n),\ndownstream AS (\n    -- level 0: job gốc\n    SELECT \n        id,\n        0 AS level\n    FROM all_config_ids\n    WHERE ('All' IN ($job_id) OR id IN ($job_id))\n\n    UNION ALL\n\n    -- downstream level n\n    SELECT \n        c.id,\n        d.level + 1 AS level\n    FROM all_config_ids c\n    JOIN downstream d \n        ON c.depend_ons ? d.id\n    WHERE d.level < $level\n),\nupstream AS (\n    -- level 0: job gốc\n    SELECT \n        id,\n        depend_ons,\n        0 AS level\n    FROM all_config_ids\n    WHERE ('All' IN ($job_id) OR id IN ($job_id))\n\n    UNION ALL\n\n    -- upstream level n\n    SELECT \n        c.id,\n        c.depend_ons,\n        u.level + 1 AS level\n    FROM all_config_ids c\n    JOIN upstream u \n        ON u.depend_ons ? c.id\n    WHERE u.level < $level\n),\nall_ids AS (\n    -- filter theo level\n    SELECT id FROM downstream WHERE level <= $level\n    UNION\n    SELECT id FROM upstream WHERE level <= $level\n)\nSELECT \n    parent_id || '->' || child_id AS id,\n    parent_id AS source,\n    child_id AS target\nFROM (\n    SELECT \n        jsonb_array_elements_text(\n            CASE \n                WHEN jsonb_typeof(depend_ons) = 'array' \n                THEN depend_ons \n                ELSE '[]'::jsonb \n            END\n        ) AS parent_id,\n        id AS child_id\n    FROM all_config_ids\n) all_links\nWHERE parent_id IN (SELECT id FROM all_ids)\n  AND child_id IN (SELECT id FROM all_ids);\n",
+          "rawSql": "WITH RECURSIVE\ndbt_job_id as (\n    select id, depend_ons, layer \n    from olap_orchestration.job_config\n    -- Lọc layer ngay từ đầu\n    where ('All' IN ($layer) OR layer IN ($layer))\n),\nall_raw_ids as (\n  SELECT\n      distinct elem as id,\n      'raw' as layer\n  FROM olap_orchestration.job_config jc\n  LEFT JOIN LATERAL jsonb_array_elements_text(\n      CASE\n          WHEN jsonb_typeof(jc.depend_ons) = 'array'\n          THEN jc.depend_ons\n          ELSE '[]'::jsonb\n      END\n  ) AS elem ON TRUE\n  where elem not in (select id from olap_orchestration.job_config) -- So sánh với toàn bộ bảng gốc\n    -- Chỉ giữ lại nếu người dùng chọn 'All' hoặc 'raw'\n    and ('All' IN ($layer) OR 'raw' IN ($layer))\n),\nall_config_ids as (\n    select id, '[]'::jsonb AS depend_ons, layer from all_raw_ids\n    union all\n    select id, depend_ons, layer from dbt_job_id\n),\ndownstream AS (\n    SELECT \n        id,\n        0 AS level\n    FROM all_config_ids\n    WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION ALL\n    -- Sử dụng all_config_ids thay vì bảng gốc để kế thừa filter layer\n    SELECT \n        c.id,\n        d.level + 1 AS level\n    FROM all_config_ids c\n    JOIN downstream d ON c.depend_ons ? d.id\n    WHERE d.level < $level\n),\nupstream AS (\n    SELECT \n        id,\n        depend_ons,\n        0 AS level\n    FROM all_config_ids\n    WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION ALL\n    SELECT \n        c.id,\n        c.depend_ons,\n        u.level + 1 AS level\n    FROM all_config_ids c\n    JOIN upstream u ON u.depend_ons ? c.id\n    WHERE u.level < $level\n),\nall_ids AS (\n    SELECT id FROM downstream WHERE level <= $level\n    UNION\n    SELECT id FROM upstream WHERE level <= $level\n),\nnodes_info AS (\n    SELECT id, layer FROM all_config_ids\n)\nSELECT \n    links.parent_id || '->' || links.child_id AS id,\n    links.parent_id AS source,\n    links.child_id AS target,\n    s_info.layer AS source_layer,\n    t_info.layer AS target_layer\nFROM (\n    SELECT \n        jsonb_array_elements_text(\n            CASE \n                WHEN jsonb_typeof(depend_ons) = 'array' \n                THEN depend_ons \n                ELSE '[]'::jsonb \n            END\n        ) AS parent_id,\n        id AS child_id\n    FROM all_config_ids\n) links\nJOIN nodes_info s_info ON links.parent_id = s_info.id\nJOIN nodes_info t_info ON links.child_id = t_info.id\nWHERE links.parent_id IN (SELECT id FROM all_ids)\n  AND links.child_id IN (SELECT id FROM all_ids);",
           "refId": "B",
           "sql": {
             "columns": [
@@ -168,7 +168,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "select count(1)\r\nfrom olap_dev.job_config",
+          "rawSql": "select count(1)\r\nfrom olap_orchestration.job_config",
           "refId": "A",
           "sql": {
             "columns": [
@@ -248,7 +248,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "with dbt_job_id as (\r\n    select id from olap_dev.job_config\r\n)\r\nSELECT\r\n    count (distinct elem)\r\nFROM olap_dev.job_config jc\r\nLEFT JOIN LATERAL jsonb_array_elements_text(\r\n    CASE\r\n        WHEN jsonb_typeof(jc.depend_ons) = 'array'\r\n        THEN jc.depend_ons\r\n        ELSE '[]'::jsonb\r\n    END\r\n) AS elem ON TRUE\r\nwhere elem not in (select id from dbt_job_id);\r\n",
+          "rawSql": "with dbt_job_id as (\r\n    select id from olap_orchestration.job_config\r\n)\r\nSELECT\r\n    count (distinct elem)\r\nFROM olap_orchestration.job_config jc\r\nLEFT JOIN LATERAL jsonb_array_elements_text(\r\n    CASE\r\n        WHEN jsonb_typeof(jc.depend_ons) = 'array'\r\n        THEN jc.depend_ons\r\n        ELSE '[]'::jsonb\r\n    END\r\n) AS elem ON TRUE\r\nwhere elem not in (select id from dbt_job_id);\r\n",
           "refId": "A",
           "sql": {
             "columns": [
@@ -328,7 +328,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "WITH\r\ndbt_job_id as (\r\n    select id from olap_dev.job_config\r\n),\r\ntotal_job AS (\r\n    SELECT COUNT(1) AS total_job\r\n    FROM olap_dev.job_config\r\n),\r\ntotal_job_run AS (\r\n    SELECT COUNT(1) AS total_job_run\r\n    FROM olap_dev.execution_log log\r\n    WHERE log.data_date::text IN ($data_date)\r\n    and job_id in (select id from dbt_job_id)\r\n)\r\nSELECT\r\n    total_job.total_job - total_job_run.total_job_run AS not_run_job\r\nFROM total_job, total_job_run;\r\n",
+          "rawSql": "WITH dbt_job_id AS (\r\n    SELECT id FROM olap_orchestration.job_config\r\n),\r\ntotal_job AS (\r\n    -- Tổng số job đang có trong cấu hình\r\n    SELECT COUNT(id) AS total_count\r\n    FROM olap_orchestration.job_config\r\n),\r\nrun_job_distinct AS (\r\n    -- Đếm số lượng JOB duy nhất đã từng chạy trong khoảng thời gian chọn\r\n    SELECT COUNT(DISTINCT job_id) AS run_count\r\n    FROM olap_orchestration.execution_log\r\n    WHERE data_date::text IN ($data_date)\r\n    AND job_id IN (SELECT id FROM dbt_job_id)\r\n)\r\nSELECT\r\n    total_job.total_count - run_job_distinct.run_count AS not_run_job_count\r\nFROM total_job, run_job_distinct;",
           "refId": "A",
           "sql": {
             "columns": [
@@ -408,7 +408,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "WITH dbt_job_id AS (\r\n    SELECT id\r\n    FROM olap_dev.job_config\r\n),\r\nraw_job_id AS (\r\n    -- các dependency KHÔNG tồn tại trong job_config\r\n    SELECT DISTINCT elem\r\n    FROM olap_dev.job_config jc\r\n    LEFT JOIN LATERAL jsonb_array_elements_text(\r\n        CASE\r\n            WHEN jsonb_typeof(jc.depend_ons) = 'array'\r\n            THEN jc.depend_ons\r\n            ELSE '[]'::jsonb\r\n        END\r\n    ) AS elem ON TRUE\r\n    WHERE elem IS NOT NULL\r\n      AND NOT EXISTS (\r\n          SELECT 1\r\n          FROM dbt_job_id d\r\n          WHERE d.id = elem\r\n      )\r\n),\r\nraw_job_total_count AS (\r\n    SELECT COUNT(*) AS total_raw_job\r\n    FROM raw_job_id\r\n),\r\ncount_job_run AS (\r\n    SELECT COUNT(DISTINCT log.data_source_name) AS total_run\r\n    FROM olap_dev.glue_catalog_ingestion_tracking log\r\n    WHERE log.data_date::text IN ($data_date)\r\n      AND log.data_source_name IN (SELECT elem FROM raw_job_id)\r\n)\r\nSELECT\r\n    r.total_raw_job - c.total_run AS not_run_raw_job\r\nFROM raw_job_total_count r\r\nCROSS JOIN count_job_run c;\r\n",
+          "rawSql": "WITH dbt_job_id AS (\r\n    SELECT id\r\n    FROM olap_orchestration.job_config\r\n),\r\nraw_job_id AS (\r\n    -- các dependency KHÔNG tồn tại trong job_config\r\n    SELECT DISTINCT elem\r\n    FROM olap_orchestration.job_config jc\r\n    LEFT JOIN LATERAL jsonb_array_elements_text(\r\n        CASE\r\n            WHEN jsonb_typeof(jc.depend_ons) = 'array'\r\n            THEN jc.depend_ons\r\n            ELSE '[]'::jsonb\r\n        END\r\n    ) AS elem ON TRUE\r\n    WHERE elem IS NOT NULL\r\n      AND NOT EXISTS (\r\n          SELECT 1\r\n          FROM dbt_job_id d\r\n          WHERE d.id = elem\r\n      )\r\n),\r\nraw_job_total_count AS (\r\n    SELECT COUNT(*) AS total_raw_job\r\n    FROM raw_job_id\r\n),\r\ncount_job_run AS (\r\n    SELECT COUNT(DISTINCT log.data_source_name) AS total_run\r\n    FROM olap_orchestration.glue_catalog_ingestion_tracking log\r\n    WHERE log.data_date::text IN ($data_date)\r\n      AND log.data_source_name IN (SELECT elem FROM raw_job_id)\r\n)\r\nSELECT\r\n    r.total_raw_job - c.total_run AS not_run_raw_job\r\nFROM raw_job_total_count r\r\nCROSS JOIN count_job_run c;\r\n",
           "refId": "A",
           "sql": {
             "columns": [
@@ -495,7 +495,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "with dbt_job_id as (\r\n    select id from olap_dev.job_config\r\n),\r\nraw_job_id as (\r\nSELECT\r\n    distinct elem\r\nFROM olap_dev.job_config jc\r\nLEFT JOIN LATERAL jsonb_array_elements_text(\r\n    CASE\r\n        WHEN jsonb_typeof(jc.depend_ons) = 'array'\r\n        THEN jc.depend_ons\r\n        ELSE '[]'::jsonb\r\n    END\r\n) AS elem ON TRUE\r\nwhere elem not in (select id from dbt_job_id)\r\n)\r\nSELECT status as \"Job Status\", count(1) as \"Job Count\" FROM olap_dev.glue_catalog_ingestion_tracking log\r\nwhere \r\n  log.data_date::text IN ($data_date)\r\n  and log.data_source_name in (select elem from raw_job_id)\r\ngroup by status",
+          "rawSql": "with dbt_job_id as (\r\n    select id from olap_orchestration.job_config\r\n),\r\nraw_job_id as (\r\nSELECT\r\n    distinct elem\r\nFROM olap_orchestration.job_config jc\r\nLEFT JOIN LATERAL jsonb_array_elements_text(\r\n    CASE\r\n        WHEN jsonb_typeof(jc.depend_ons) = 'array'\r\n        THEN jc.depend_ons\r\n        ELSE '[]'::jsonb\r\n    END\r\n) AS elem ON TRUE\r\nwhere elem not in (select id from dbt_job_id)\r\n)\r\nSELECT status as \"Job Status\", count(1) as \"Job Count\" FROM olap_orchestration.glue_catalog_ingestion_tracking log\r\nwhere \r\n  log.data_date::text IN ($data_date)\r\n  and log.data_source_name in (select elem from raw_job_id)\r\ngroup by status",
           "refId": "A",
           "sql": {
             "columns": [
@@ -582,7 +582,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "with dbt_job_id as (\r\n    select id from olap_dev.job_config\r\n)\r\nSELECT status as \"Job Status\", count(1) as \"Job Count\" FROM olap_dev.execution_log log\r\nwhere \r\n  log.data_date::text IN ($data_date)\r\n  and job_id in (select id from dbt_job_id)\r\ngroup by status",
+          "rawSql": "with dbt_job_id as (\r\n    select id from olap_orchestration.job_config\r\n)\r\nSELECT status as \"Job Status\", count(1) as \"Job Count\" FROM olap_orchestration.execution_log log\r\nwhere \r\n  log.data_date::text IN ($data_date)\r\n  and job_id in (select id from dbt_job_id)\r\ngroup by status",
           "refId": "A",
           "sql": {
             "columns": [
@@ -613,6 +613,266 @@
         "w": 24,
         "x": 0,
         "y": 17
+      },
+      "id": 14,
+      "panels": [],
+      "title": "Job Selected",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "dfbbnkjf9lhc0c"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 18,
+        "x": 0,
+        "y": 18
+      },
+      "id": 13,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "10.4.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "dfbbnkjf9lhc0c"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT \n    execution_id,\n    job_id,\n    data_date::text,\n    depend_ons,\n    dependency_status,\n    job_config,\n    status,\n    detail_status,\n    error_message,\n    max_retry,\n    retry,\n    start_time::text,\n    end_time::text,\n    data_date_type,\n    duration,\n    cron_expression,\n    run_dependencies,\n    schedule_type,\n    log_retention_days,\n    engine_run_id,\n    redshift_write_status,\n    redshift_write_result,\n    execution_steps,\n    test_results,\n    test_status,\n    layer\nFROM olap_orchestration.execution_log log\nWHERE log.job_id IN ($job_id)\n  AND ('All' IN ($data_date) OR log.data_date::text IN ($data_date))\n    AND (\n    'All' IN ($status)\n    OR log.status IN ($status)\n)\norder by log.data_date desc",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "Job Logs",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "dfbbnkjf9lhc0c"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "dark-green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 3,
+        "x": 18,
+        "y": 18
+      },
+      "id": 15,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "10.4.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "dfbbnkjf9lhc0c"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT \r\n    count(1)\r\nFROM olap_orchestration.execution_log log\r\nWHERE log.job_id IN ($job_id)\r\nAND log.status = 'SUCCESS'\r\n",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "Total SUCCESS",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "dfbbnkjf9lhc0c"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "dark-red",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 3,
+        "x": 21,
+        "y": 18
+      },
+      "id": 16,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "10.4.1",
+      "targets": [
+        {
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "dfbbnkjf9lhc0c"
+          },
+          "editorMode": "code",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT \r\n    count(1)\r\nFROM olap_orchestration.execution_log log\r\nWHERE log.job_id IN ($job_id)\r\nAND log.status = 'FAILED'\r\n",
+          "refId": "A",
+          "sql": {
+            "columns": [
+              {
+                "parameters": [],
+                "type": "function"
+              }
+            ],
+            "groupBy": [
+              {
+                "property": {
+                  "type": "string"
+                },
+                "type": "groupBy"
+              }
+            ],
+            "limit": 50
+          }
+        }
+      ],
+      "title": "Total FAILED",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 25
       },
       "id": 6,
       "panels": [],
@@ -670,7 +930,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 18
+        "y": 26
       },
       "id": 3,
       "options": {
@@ -696,7 +956,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "WITH RECURSIVE \ndownstream AS (\n    -- FIXED: Removed hardcoded 'cron-monitoring...' replaced with variable\n    SELECT id FROM olap_dev.job_config WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION\n    SELECT c.id \n    FROM olap_dev.job_config c\n    JOIN downstream d ON c.depend_ons ? d.id\n),\nupstream AS (\n    SELECT id, depend_ons FROM olap_dev.job_config WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION\n    SELECT c.id, c.depend_ons\n    FROM olap_dev.job_config c\n    JOIN upstream u ON u.depend_ons ? c.id\n),\nall_ids AS (\n    SELECT id FROM downstream\n    UNION\n    SELECT id FROM upstream\n)\nSELECT \n    execution_id,\n    job_id,\n    data_date::text,\n    depend_ons,\n    dependency_status,\n    job_config,\n    status,\n    detail_status,\n    error_message,\n    max_retry,\n    retry,\n    start_time::text,\n    end_time::text,\n    data_date_type,\n    duration,\n    cron_expression,\n    run_dependencies,\n    schedule_type,\n    log_retention_days,\n    engine_run_id,\n    redshift_write_status,\n    redshift_write_result,\n    execution_steps,\n    test_results,\n    test_status\nFROM olap_dev.execution_log log\nWHERE log.job_id IN (SELECT id FROM all_ids) \n  AND ('All' IN ($data_date) OR log.data_date::text IN ($data_date))\n  AND (\n    'All' IN ($status)\n    OR log.status IN ($status)\n)\n",
+          "rawSql": "WITH RECURSIVE \ndownstream AS (\n    -- FIXED: Removed hardcoded 'cron-monitoring...' replaced with variable\n    SELECT id FROM olap_orchestration.job_config WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION\n    SELECT c.id \n    FROM olap_orchestration.job_config c\n    JOIN downstream d ON c.depend_ons ? d.id\n),\nupstream AS (\n    SELECT id, depend_ons FROM olap_orchestration.job_config WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION\n    SELECT c.id, c.depend_ons\n    FROM olap_orchestration.job_config c\n    JOIN upstream u ON u.depend_ons ? c.id\n),\nall_ids AS (\n    SELECT id FROM downstream\n    UNION\n    SELECT id FROM upstream\n)\nSELECT \n    execution_id,\n    job_id,\n    data_date::text,\n    depend_ons,\n    dependency_status,\n    job_config,\n    status,\n    detail_status,\n    error_message,\n    max_retry,\n    retry,\n    start_time::text,\n    end_time::text,\n    data_date_type,\n    duration,\n    cron_expression,\n    run_dependencies,\n    schedule_type,\n    log_retention_days,\n    engine_run_id,\n    redshift_write_status,\n    redshift_write_result,\n    execution_steps,\n    test_results,\n    test_status,\n    layer\nFROM olap_orchestration.execution_log log\nWHERE log.job_id IN (SELECT id FROM all_ids) \n  AND ('All' IN ($data_date) OR log.data_date::text IN ($data_date))\n  AND (\n    'All' IN ($status)\n    OR log.status IN ($status)\n)\n\nAND (\n    'All' IN ($layer)\n    OR log.layer IN ($layer)\n)\n",
           "refId": "A",
           "sql": {
             "columns": [
@@ -758,7 +1018,7 @@
         "h": 8,
         "w": 24,
         "x": 0,
-        "y": 26
+        "y": 34
       },
       "id": 2,
       "options": {
@@ -783,7 +1043,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "WITH RECURSIVE \ndownstream AS (\n    -- FIXED: Used standardized variable syntax\n    SELECT id FROM olap_dev.job_config WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION\n    SELECT c.id \n    FROM olap_dev.job_config c\n    JOIN downstream d ON c.depend_ons ? d.id\n),\nupstream AS (\n    SELECT id, depend_ons FROM olap_dev.job_config WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION\n    SELECT c.id, c.depend_ons\n    FROM olap_dev.job_config c\n    JOIN upstream u ON u.depend_ons ? c.id\n),\nall_ids AS (\n    SELECT id FROM downstream\n    UNION\n    SELECT id FROM upstream\n)\nSELECT * FROM olap_dev.job_config conf\nWHERE conf.id IN (SELECT id FROM all_ids);",
+          "rawSql": "WITH RECURSIVE \ndownstream AS (\n    -- FIXED: Used standardized variable syntax\n    SELECT id FROM olap_orchestration.job_config WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION\n    SELECT c.id \n    FROM olap_orchestration.job_config c\n    JOIN downstream d ON c.depend_ons ? d.id\n),\nupstream AS (\n    SELECT id, depend_ons FROM olap_orchestration.job_config WHERE ('All' IN ($job_id) OR id IN ($job_id))\n    UNION\n    SELECT c.id, c.depend_ons\n    FROM olap_orchestration.job_config c\n    JOIN upstream u ON u.depend_ons ? c.id\n),\nall_ids AS (\n    SELECT id FROM downstream\n    UNION\n    SELECT id FROM upstream\n)\nSELECT * FROM olap_orchestration.job_config conf\nWHERE conf.id IN (SELECT id FROM all_ids)\n\nAND (\n    'All' IN ($layer)\n    OR conf.layer IN ($layer)\n)\n",
           "refId": "A",
           "sql": {
             "columns": [
@@ -819,24 +1079,24 @@
         "current": {
           "selected": true,
           "text": [
-            "ar_loan_contract"
+            "ar_deposit"
           ],
           "value": [
-            "ar_loan_contract"
+            "ar_deposit"
           ]
         },
         "datasource": {
           "type": "grafana-postgresql-datasource",
           "uid": "dfbbnkjf9lhc0c"
         },
-        "definition": "select id from olap_dev.job_config;",
+        "definition": "select id from olap_orchestration.job_config;",
         "description": "",
         "hide": 0,
         "includeAll": false,
         "multi": true,
         "name": "job_id",
         "options": [],
-        "query": "select id from olap_dev.job_config;",
+        "query": "select id from olap_orchestration.job_config;",
         "refresh": 1,
         "regex": "",
         "skipUrlSync": false,
@@ -845,22 +1105,22 @@
       },
       {
         "current": {
-          "selected": false,
-          "text": "2026-01-12",
-          "value": "2026-01-12"
+          "selected": true,
+          "text": "2026-03-09",
+          "value": "2026-03-09"
         },
         "datasource": {
           "type": "grafana-postgresql-datasource",
           "uid": "dfbbnkjf9lhc0c"
         },
-        "definition": "\nselect data_date::text from olap_dev.execution_log o;",
+        "definition": "\nselect data_date::text from olap_orchestration.execution_log o;",
         "description": "",
         "hide": 0,
         "includeAll": true,
         "multi": false,
         "name": "data_date",
         "options": [],
-        "query": "\nselect data_date::text from olap_dev.execution_log o;",
+        "query": "\nselect data_date::text from olap_orchestration.execution_log o;",
         "refresh": 1,
         "regex": "",
         "skipUrlSync": false,
@@ -881,13 +1141,13 @@
           "type": "grafana-postgresql-datasource",
           "uid": "dfbbnkjf9lhc0c"
         },
-        "definition": "select distinct status::text from olap_dev.execution_log\nUNION ALL\nselect 'NOT_STARTED' as status;",
+        "definition": "select distinct status::text from olap_orchestration.execution_log\nUNION ALL\nselect 'NO_LOG' as status;",
         "hide": 0,
         "includeAll": true,
         "multi": true,
         "name": "status",
         "options": [],
-        "query": "select distinct status::text from olap_dev.execution_log\nUNION ALL\nselect 'NOT_STARTED' as status;",
+        "query": "select distinct status::text from olap_orchestration.execution_log\nUNION ALL\nselect 'NO_LOG' as status;",
         "refresh": 1,
         "regex": "",
         "skipUrlSync": false,
@@ -899,7 +1159,7 @@
         "auto_count": 30,
         "auto_min": "10s",
         "current": {
-          "selected": false,
+          "selected": true,
           "text": "1",
           "value": "1"
         },
@@ -953,6 +1213,33 @@
         "refresh": 2,
         "skipUrlSync": false,
         "type": "interval"
+      },
+      {
+        "current": {
+          "selected": false,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "grafana-postgresql-datasource",
+          "uid": "dfbbnkjf9lhc0c"
+        },
+        "definition": "SELECT DISTINCT layer \nFROM olap_orchestration.job_config\n\nUNION\n\nSELECT 'raw' AS layer\nORDER BY layer ASC;",
+        "hide": 0,
+        "includeAll": true,
+        "multi": true,
+        "name": "layer",
+        "options": [],
+        "query": "SELECT DISTINCT layer \nFROM olap_orchestration.job_config\n\nUNION\n\nSELECT 'raw' AS layer\nORDER BY layer ASC;",
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
       }
     ]
   },
@@ -966,6 +1253,6 @@
   "timezone": "browser",
   "title": "Orches Full Layer",
   "uid": "afagos32k5wjkc",
-  "version": 27,
+  "version": 37,
   "weekStart": ""
 }

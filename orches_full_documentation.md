@@ -6,21 +6,21 @@ Dashboard **Orches Full Layer** là một công cụ giám sát và quản lý d
 
 **Dashboard UID**: `afagos32k5wjkc`  
 **Datasource**: PostgreSQL (Grafana PostgreSQL Datasource)  
-**Database Schema**: `olap_dev`
+**Database Schema**: `olap_orchestration`
 
 ## Kiến Trúc Hệ Thống
 
 Dashboard này quản lý 2 loại jobs:
 
 ### 1. DBT Jobs
-- Được lưu trong table `olap_dev.job_config`
-- Execution logs trong `olap_dev.execution_log`
+- Được lưu trong table `olap_orchestration.job_config`
+- Execution logs trong `olap_orchestration.execution_log`
 - Có dependencies được định nghĩa trong field `depend_ons` (JSONB array)
 
 ### 2. Raw Jobs (Glue Catalog Ingestion)
 - External jobs KHÔNG có configuration trong `job_config`
 - Được referenced như dependencies của DBT jobs
-- Tracking logs trong `olap_dev.glue_catalog_ingestion_tracking`
+- Tracking logs trong `olap_orchestration.glue_catalog_ingestion_tracking`
 - Thường là data sources: S3, Glue Catalog, external databases
 
 ## Biến Template
@@ -28,15 +28,15 @@ Dashboard này quản lý 2 loại jobs:
 Dashboard sử dụng các biến sau để filter và customize views:
 
 ### $job_id (Multi-select)
-- **Nguồn**: Query từ `olap_dev.job_config`
-- **Query**: `select id from olap_dev.job_config;`
+- **Nguồn**: Query từ `olap_orchestration.job_config`
+- **Query**: `select id from olap_orchestration.job_config;`
 - **Mô tả**: Chọn job cụ thể để xem dependencies
 - **Hỗ trợ**: Multi-select, có thể chọn "All"
 - **Use case**: Filter jobs cần analyze trong node graph và tables
 
 ### $data_date (Single select)
-- **Nguồn**: Query từ `olap_dev.execution_log`
-- **Query**: `select data_date::text from olap_dev.execution_log;`
+- **Nguồn**: Query từ `olap_orchestration.execution_log`
+- **Query**: `select data_date::text from olap_orchestration.execution_log;`
 - **Mô tả**: Chọn ngày execution cần xem
 - **Sort**: Descending (mới nhất trước)
 - **Hỗ trợ**: Include "All" để xem multiple dates
@@ -46,7 +46,7 @@ Dashboard sử dụng các biến sau để filter và customize views:
 - **Nguồn**: Query từ execution logs
 - **Query**: 
   ```sql
-  select distinct status::text from olap_dev.execution_log
+  select distinct status::text from olap_orchestration.execution_log
   UNION ALL
   select 'NOT_STARTED' as status;
   ```
@@ -71,6 +71,20 @@ Dashboard sử dụng các biến sau để filter và customize views:
   - Level 3+: Deep dependency chains
 - **Use case**: Control complexity của node graph visualization
 
+### $layer (Multi-select)
+- **Nguồn**: Query kết hợp từ `olap_orchestration.job_config` và giá trị `raw`
+- **Query**: 
+  ```sql
+  SELECT DISTINCT layer 
+  FROM olap_orchestration.job_config
+  UNION
+  SELECT 'raw' AS layer
+  ORDER BY layer ASC;
+  ```
+- **Mô tả**: Filter nodes và logs theo tầng dữ liệu (layer)
+- **Hỗ trợ**: Multi-select, Include "All"
+- **Use case**: Dùng để filter pipeline jobs hoặc raw events theo tầng (vd: raw, staging, mart, v.v)
+
 ## Các Panels Chi Tiết
 
 ### Row 1: Job Summary per Day
@@ -86,18 +100,21 @@ Dashboard sử dụng các biến sau để filter và customize views:
 **Mục đích**: 
 Hiển thị dependency graph của jobs với visual representation của relationships và execution status.
 
-**Query A - Nodes** (Job nodes với status):
+**Query A - Nodes** (Job nodes với status, hiển thị node detail bổ sung):
 ```sql
 WITH RECURSIVE
 dbt_job_id as (
-    select id, depend_ons from olap_dev.job_config
+    -- Bước 1: Lấy thêm layer từ config
+    select id, depend_ons, layer from olap_orchestration.job_config
 ),
 all_raw_ids as (
-  -- Extract raw job IDs from depend_ons
-  SELECT distinct elem as id
-  FROM olap_dev.job_config jc
+  SELECT
+      distinct elem as id,
+      'raw' as layer -- Bước 2: Gán nhãn 'raw' cho các id ngoại lai
+  FROM olap_orchestration.job_config jc
   LEFT JOIN LATERAL jsonb_array_elements_text(
-      CASE WHEN jsonb_typeof(jc.depend_ons) = 'array'
+      CASE
+          WHEN jsonb_typeof(jc.depend_ons) = 'array'
           THEN jc.depend_ons
           ELSE '[]'::jsonb
       END
@@ -105,48 +122,61 @@ all_raw_ids as (
   where elem not in (select id from dbt_job_id)
 ),
 all_config_ids as (
-    -- Combine DBT jobs + Raw jobs
-    select id, '[]'::jsonb AS depend_ons from all_raw_ids
+    -- Bước 3: Hợp nhất layer vào danh sách ID
+    select id, '[]'::jsonb AS depend_ons, layer from all_raw_ids
     union all
-    select id, depend_ons from dbt_job_id
+    select id, depend_ons, layer from dbt_job_id
 ),
 downstream AS (
-    -- Level 0: Root jobs
-    SELECT id, 0 AS level
+    SELECT 
+        id,
+        0 AS level
     FROM all_config_ids
     WHERE ('All' IN ($job_id) OR id IN ($job_id))
-    
     UNION ALL
-    
-    -- Level n: Downstream dependencies
-    SELECT c.id, d.level + 1 AS level
-    FROM olap_dev.job_config c
+    SELECT 
+        c.id,
+        d.level + 1 AS level
+    FROM olap_orchestration.job_config c
     JOIN downstream d ON c.depend_ons ? d.id
-    WHERE d.level < $level
+    WHERE d.level < $level 
 ),
 upstream AS (
-    -- Level 0: Root jobs
-    SELECT id, depend_ons, 0 AS level
+    SELECT 
+        id,
+        depend_ons,
+        0 AS level
     FROM all_config_ids
     WHERE ('All' IN ($job_id) OR id IN ($job_id))
-    
     UNION ALL
-    
-    -- Level n: Upstream dependencies
-    SELECT c.id, c.depend_ons, u.level + 1 AS level
+    SELECT 
+        c.id,
+        c.depend_ons,
+        u.level + 1 AS level
     FROM all_config_ids c
     JOIN upstream u ON u.depend_ons ? c.id
     WHERE u.level < $level
 ),
 all_logs as (
-    -- Combine logs from both sources
-    select job_id, data_date, status from olap_dev.execution_log 
+    select 
+        job_id, 
+        data_date, 
+        status,
+        start_time,
+        end_time,
+        layer
+    from olap_orchestration.execution_log 
     union all
-    select data_source_name as job_id, data_date, status 
-    from olap_dev.glue_catalog_ingestion_tracking
+    select 
+        data_source_name as job_id, 
+        data_date, 
+        status,
+        created_at as start_time,
+        updated_at as end_time,
+        'raw' as layer
+    from olap_orchestration.glue_catalog_ingestion_tracking
 ),
 all_ids AS (
-    -- Filter by level
     SELECT id FROM downstream WHERE level <= $level
     UNION
     SELECT id FROM upstream WHERE level <= $level
@@ -154,43 +184,117 @@ all_ids AS (
 SELECT DISTINCT ON (conf.id)
     conf.id AS id,
     conf.id AS title,
-    COALESCE(log.status, 'NOT_STARTED') AS "mainStat",
+    -- Ưu tiên layer từ config, nếu log không có thì lấy từ config
+    'Layer: ' || COALESCE(conf.layer, log.layer, 'N/A') as subtitle,
+    COALESCE(log.status, 'NO_LOG') AS "mainStat",
     CASE 
-        WHEN log.status = 'Completed' THEN 'green'
-        WHEN log.status = 'SUCCESS' THEN 'green'
+        WHEN log.status IN ('Completed', 'SUCCESS') THEN 'green'
         WHEN log.status = 'FAILED' THEN 'red'
         WHEN log.status = 'RUNNING' THEN 'blue'
         WHEN log.status = 'PENDING' THEN 'orange'
         WHEN log.status = 'QUEUE' THEN 'purple'
         ELSE 'gray' 
-    END AS color
+    END AS color,
+    -- Metadata chi tiết
+    COALESCE(TO_CHAR(log.start_time, 'HH24:MI:SS'), 'N/A')::text AS "detail__start_time",
+    COALESCE(TO_CHAR(log.end_time, 'HH24:MI:SS'), 'N/A')::text AS "detail__end_time",
+    COALESCE(
+        (EXTRACT(EPOCH FROM (log.end_time - log.start_time))::int)::text || 's',
+        'N/A'
+    )::text AS "detail__duration",
+    COALESCE(log.status, 'NO_LOG') AS "detail__status",
+    COALESCE(log.data_date::text, 'N/A') AS "detail__data_date",
+    COALESCE(conf.layer, log.layer, 'N/A')::text AS "detail__layer",
+    conf.id AS "detail__job_id"
 FROM all_config_ids conf
 LEFT JOIN all_logs log 
     ON conf.id = log.job_id 
    AND ('All' IN ($data_date) OR log.data_date::text IN ($data_date))
-WHERE conf.id IN (SELECT id FROM all_ids);
+WHERE conf.id IN (SELECT id FROM all_ids)
+-- Thêm filter layer:
+AND ('All' IN ($layer) OR conf.layer IN ($layer)) 
+ORDER BY conf.id, log.start_time DESC NULLS LAST;
 ```
 
 **Query B - Edges** (Dependency links):
 ```sql
--- Returns relationships between jobs
+WITH RECURSIVE
+dbt_job_id as (
+    select id, depend_ons, layer 
+    from olap_orchestration.job_config
+    -- Lọc layer ngay từ đầu
+    where ('All' IN ($layer) OR layer IN ($layer))
+),
+all_raw_ids as (
+  SELECT
+      distinct elem as id,
+      'raw' as layer
+  FROM olap_orchestration.job_config jc
+  LEFT JOIN LATERAL jsonb_array_elements_text(
+      CASE
+          WHEN jsonb_typeof(jc.depend_ons) = 'array'
+          THEN jc.depend_ons
+          ELSE '[]'::jsonb
+      END
+  ) AS elem ON TRUE
+  where elem not in (select id from olap_orchestration.job_config) 
+    and ('All' IN ($layer) OR 'raw' IN ($layer))
+),
+all_config_ids as (
+    select id, '[]'::jsonb AS depend_ons, layer from all_raw_ids
+    union all
+    select id, depend_ons, layer from dbt_job_id
+),
+downstream AS (
+    SELECT id, 0 AS level
+    FROM all_config_ids
+    WHERE ('All' IN ($job_id) OR id IN ($job_id))
+    UNION ALL
+    SELECT c.id, d.level + 1 AS level
+    FROM all_config_ids c
+    JOIN downstream d ON c.depend_ons ? d.id
+    WHERE d.level < $level
+),
+upstream AS (
+    SELECT id, depend_ons, 0 AS level
+    FROM all_config_ids
+    WHERE ('All' IN ($job_id) OR id IN ($job_id))
+    UNION ALL
+    SELECT c.id, c.depend_ons, u.level + 1 AS level
+    FROM all_config_ids c
+    JOIN upstream u ON u.depend_ons ? c.id
+    WHERE u.level < $level
+),
+all_ids AS (
+    SELECT id FROM downstream WHERE level <= $level
+    UNION
+    SELECT id FROM upstream WHERE level <= $level
+),
+nodes_info AS (
+    SELECT id, layer FROM all_config_ids
+)
 SELECT 
-    parent_id || '->' || child_id AS id,
-    parent_id AS source,
-    child_id AS target
+    links.parent_id || '->' || links.child_id AS id,
+    links.parent_id AS source,
+    links.child_id AS target,
+    s_info.layer AS source_layer,
+    t_info.layer AS target_layer
 FROM (
     SELECT 
         jsonb_array_elements_text(
-            CASE WHEN jsonb_typeof(depend_ons) = 'array' 
+            CASE 
+                WHEN jsonb_typeof(depend_ons) = 'array' 
                 THEN depend_ons 
                 ELSE '[]'::jsonb 
             END
         ) AS parent_id,
         id AS child_id
     FROM all_config_ids
-) all_links
-WHERE parent_id IN (SELECT id FROM all_ids)
-  AND child_id IN (SELECT id FROM all_ids);
+) links
+JOIN nodes_info s_info ON links.parent_id = s_info.id
+JOIN nodes_info t_info ON links.child_id = t_info.id
+WHERE links.parent_id IN (SELECT id FROM all_ids)
+  AND links.child_id IN (SELECT id FROM all_ids);
 ```
 
 **Node Colors**:
@@ -224,7 +328,7 @@ WHERE parent_id IN (SELECT id FROM all_ids)
 **Query**:
 ```sql
 select count(1)
-from olap_dev.job_config
+from olap_orchestration.job_config
 ```
 
 **Ý nghĩa**: 
@@ -245,10 +349,10 @@ Tổng số DBT jobs được configured trong hệ thống.
 **Query**:
 ```sql
 with dbt_job_id as (
-    select id from olap_dev.job_config
+    select id from olap_orchestration.job_config
 )
 SELECT count(distinct elem)
-FROM olap_dev.job_config jc
+FROM olap_orchestration.job_config jc
 LEFT JOIN LATERAL jsonb_array_elements_text(
     CASE
         WHEN jsonb_typeof(jc.depend_ons) = 'array'
@@ -285,15 +389,15 @@ Tổng số Raw jobs (external dependencies) được referenced trong DBT jobs 
 ```sql
 WITH
 dbt_job_id as (
-    select id from olap_dev.job_config
+    select id from olap_orchestration.job_config
 ),
 total_job AS (
     SELECT COUNT(1) AS total_job
-    FROM olap_dev.job_config
+    FROM olap_orchestration.job_config
 ),
 total_job_run AS (
     SELECT COUNT(1) AS total_job_run
-    FROM olap_dev.execution_log log
+    FROM olap_orchestration.execution_log log
     WHERE log.data_date::text IN ($data_date)
     and job_id in (select id from dbt_job_id)
 )
@@ -314,13 +418,13 @@ Số lượng DBT jobs CHƯA được execute trong selected date.
 ```sql
 -- Find which jobs didn't run
 WITH dbt_job_id as (
-    select id from olap_dev.job_config
+    select id from olap_orchestration.job_config
 )
 SELECT jc.id
-FROM olap_dev.job_config jc
+FROM olap_orchestration.job_config jc
 WHERE jc.id NOT IN (
     SELECT job_id 
-    FROM olap_dev.execution_log 
+    FROM olap_orchestration.execution_log 
     WHERE data_date = '2026-01-12'
 )
 ORDER BY jc.id;
@@ -349,12 +453,12 @@ ORDER BY jc.id;
 **Query**:
 ```sql
 WITH dbt_job_id AS (
-    SELECT id FROM olap_dev.job_config
+    SELECT id FROM olap_orchestration.job_config
 ),
 raw_job_id AS (
     -- Dependencies NOT in job_config
     SELECT DISTINCT elem
-    FROM olap_dev.job_config jc
+    FROM olap_orchestration.job_config jc
     LEFT JOIN LATERAL jsonb_array_elements_text(
         CASE
             WHEN jsonb_typeof(jc.depend_ons) = 'array'
@@ -373,7 +477,7 @@ raw_job_total_count AS (
 ),
 count_job_run AS (
     SELECT COUNT(DISTINCT log.data_source_name) AS total_run
-    FROM olap_dev.glue_catalog_ingestion_tracking log
+    FROM olap_orchestration.glue_catalog_ingestion_tracking log
     WHERE log.data_date::text IN ($data_date)
       AND log.data_source_name IN (SELECT elem FROM raw_job_id)
 )
@@ -397,11 +501,11 @@ Raw jobs not running → DBT jobs không có fresh data → Pipeline incomplete
 ```sql
 -- Find which raw jobs didn't run
 WITH dbt_job_id AS (
-    SELECT id FROM olap_dev.job_config
+    SELECT id FROM olap_orchestration.job_config
 ),
 raw_job_id AS (
     SELECT DISTINCT elem
-    FROM olap_dev.job_config jc
+    FROM olap_orchestration.job_config jc
     LEFT JOIN LATERAL jsonb_array_elements_text(
         CASE
             WHEN jsonb_typeof(jc.depend_ons) = 'array'
@@ -416,7 +520,7 @@ SELECT r.elem as raw_job_id
 FROM raw_job_id r
 WHERE r.elem NOT IN (
     SELECT data_source_name 
-    FROM olap_dev.glue_catalog_ingestion_tracking
+    FROM olap_orchestration.glue_catalog_ingestion_tracking
     WHERE data_date = '2026-01-12'
 )
 ORDER BY r.elem;
@@ -446,11 +550,11 @@ ORDER BY r.elem;
 **Query**:
 ```sql
 with dbt_job_id as (
-    select id from olap_dev.job_config
+    select id from olap_orchestration.job_config
 ),
 raw_job_id as (
     SELECT distinct elem
-    FROM olap_dev.job_config jc
+    FROM olap_orchestration.job_config jc
     LEFT JOIN LATERAL jsonb_array_elements_text(
         CASE
             WHEN jsonb_typeof(jc.depend_ons) = 'array'
@@ -463,7 +567,7 @@ raw_job_id as (
 SELECT 
     status as "Job Status", 
     count(1) as "Job Count" 
-FROM olap_dev.glue_catalog_ingestion_tracking log
+FROM olap_orchestration.glue_catalog_ingestion_tracking log
 where 
   log.data_date::text IN ($data_date)
   and log.data_source_name in (select elem from raw_job_id)
@@ -504,12 +608,12 @@ Target: > 95% success rate
 **Query**:
 ```sql
 with dbt_job_id as (
-    select id from olap_dev.job_config
+    select id from olap_orchestration.job_config
 )
 SELECT 
     status as "Job Status", 
     count(1) as "Job Count" 
-FROM olap_dev.execution_log log
+FROM olap_orchestration.execution_log log
 where 
   log.data_date::text IN ($data_date)
   and job_id in (select id from dbt_job_id)
@@ -550,11 +654,97 @@ Target: < 2%
 
 ---
 
-### Row 2: Job Dependencies
+### Row 2: Job Selected
 
 ---
 
-#### Panel 8: Execution Log (Table)
+#### Panel 8: Job Logs (Table)
+
+**Visualization Type**: Table  
+**Grid Position**: Row 2, Y: 18, Width 18, Height 7
+
+**Query**:
+```sql
+SELECT 
+    execution_id,
+    job_id,
+    data_date::text,
+    depend_ons,
+    dependency_status,
+    job_config,
+    status,
+    detail_status,
+    error_message,
+    max_retry,
+    retry,
+    start_time::text,
+    end_time::text,
+    data_date_type,
+    duration,
+    cron_expression,
+    run_dependencies,
+    schedule_type,
+    log_retention_days,
+    engine_run_id,
+    redshift_write_status,
+    redshift_write_result,
+    execution_steps,
+    test_results,
+    test_status,
+    layer
+FROM olap_orchestration.execution_log log
+WHERE log.job_id IN ($job_id)
+  AND ('All' IN ($data_date) OR log.data_date::text IN ($data_date))
+  AND ('All' IN ($status) OR log.status IN ($status))
+ORDER BY log.data_date desc
+```
+
+**Ý nghĩa**:
+Hiển thị lịch sử chạy chi tiết của các job được chọn trực tiếp trong biến `$job_id`. 
+
+---
+
+#### Panel 9: Total SUCCESS (Stat)
+
+**Visualization Type**: Stat panel  
+**Grid Position**: Row 2, X: 18, Y: 18, Width 3, Height 7
+
+**Query**:
+```sql
+SELECT count(1)
+FROM olap_orchestration.execution_log log
+WHERE log.job_id IN ($job_id)
+AND log.status = 'SUCCESS'
+```
+
+**Ý nghĩa**:
+Đếm tổng số lượt chạy thành công của các job thuộc `$job_id` được chọn.
+
+---
+
+#### Panel 10: Total FAILED (Stat)
+
+**Visualization Type**: Stat panel  
+**Grid Position**: Row 2, X: 21, Y: 18, Width 3, Height 7
+
+**Query**:
+```sql
+SELECT count(1)
+FROM olap_orchestration.execution_log log
+WHERE log.job_id IN ($job_id)
+AND log.status = 'FAILED'
+```
+
+**Ý nghĩa**:
+Đếm tổng số lượt chạy thất bại của các job thuộc `$job_id` được chọn. Quan trọng để cảnh báo và fix lỗi kịp thời.
+
+---
+
+### Row 3: Job Dependencies
+
+---
+
+#### Panel 11: Execution Log (Table)
 
 **Visualization Type**: Table  
 **Grid Position**: Row 2, Y: 18, Width 24, Height 8
@@ -563,20 +753,20 @@ Target: < 2%
 ```sql
 WITH RECURSIVE 
 downstream AS (
-    SELECT id FROM olap_dev.job_config 
+    SELECT id FROM olap_orchestration.job_config 
     WHERE ('All' IN ($job_id) OR id IN ($job_id))
     UNION
     SELECT c.id 
-    FROM olap_dev.job_config c
+    FROM olap_orchestration.job_config c
     JOIN downstream d ON c.depend_ons ? d.id
 ),
 upstream AS (
     SELECT id, depend_ons 
-    FROM olap_dev.job_config 
+    FROM olap_orchestration.job_config 
     WHERE ('All' IN ($job_id) OR id IN ($job_id))
     UNION
     SELECT c.id, c.depend_ons
-    FROM olap_dev.job_config c
+    FROM olap_orchestration.job_config c
     JOIN upstream u ON u.depend_ons ? c.id
 ),
 all_ids AS (
@@ -609,11 +799,13 @@ SELECT
     redshift_write_result,
     execution_steps,
     test_results,
-    test_status
-FROM olap_dev.execution_log log
+    test_status,
+    layer
+FROM olap_orchestration.execution_log log
 WHERE log.job_id IN (SELECT id FROM all_ids) 
   AND ('All' IN ($data_date) OR log.data_date::text IN ($data_date))
   AND ('All' IN ($status) OR log.status IN ($status))
+  AND ('All' IN ($layer) OR log.layer IN ($layer))
 ```
 
 **Key Columns**:
@@ -671,7 +863,7 @@ SELECT
     retry,
     start_time,
     end_time
-FROM olap_dev.execution_log
+FROM olap_orchestration.execution_log
 WHERE status = 'FAILED'
   AND data_date = '2026-01-12'
 ORDER BY start_time DESC;
@@ -685,7 +877,7 @@ SELECT
     AVG(duration) as avg_duration,
     MAX(duration) as max_duration,
     COUNT(*) as execution_count
-FROM olap_dev.execution_log
+FROM olap_orchestration.execution_log
 WHERE status = 'Completed'
   AND data_date >= CURRENT_DATE - 7
 GROUP BY job_id
@@ -702,7 +894,7 @@ SELECT
     retry,
     max_retry,
     error_message
-FROM olap_dev.execution_log
+FROM olap_orchestration.execution_log
 WHERE retry > 0
 ORDER BY retry DESC, data_date DESC;
 ```
@@ -716,7 +908,7 @@ SELECT
     log.depend_ons,
     log.dependency_status,
     log.start_time
-FROM olap_dev.execution_log log
+FROM olap_orchestration.execution_log log
 WHERE log.data_date = '2026-01-12'
 ORDER BY log.start_time;
 ```
@@ -730,7 +922,7 @@ SELECT
     test_status,
     test_results,
     status
-FROM olap_dev.execution_log
+FROM olap_orchestration.execution_log
 WHERE test_status = 'FAILED'
   AND data_date >= CURRENT_DATE - 7
 ORDER BY data_date DESC;
@@ -747,7 +939,7 @@ ORDER BY data_date DESC;
 
 ---
 
-#### Panel 9: Job Config (Table)
+#### Panel 12: Job Config (Table)
 
 **Visualization Type**: Table  
 **Grid Position**: Row 2, Y: 26, Width 24, Height 8
@@ -756,20 +948,20 @@ ORDER BY data_date DESC;
 ```sql
 WITH RECURSIVE 
 downstream AS (
-    SELECT id FROM olap_dev.job_config 
+    SELECT id FROM olap_orchestration.job_config 
     WHERE ('All' IN ($job_id) OR id IN ($job_id))
     UNION
     SELECT c.id 
-    FROM olap_dev.job_config c
+    FROM olap_orchestration.job_config c
     JOIN downstream d ON c.depend_ons ? d.id
 ),
 upstream AS (
     SELECT id, depend_ons 
-    FROM olap_dev.job_config 
+    FROM olap_orchestration.job_config 
     WHERE ('All' IN ($job_id) OR id IN ($job_id))
     UNION
     SELECT c.id, c.depend_ons
-    FROM olap_dev.job_config c
+    FROM olap_orchestration.job_config c
     JOIN upstream u ON u.depend_ons ? c.id
 ),
 all_ids AS (
@@ -777,8 +969,9 @@ all_ids AS (
     UNION
     SELECT id FROM upstream
 )
-SELECT * FROM olap_dev.job_config conf
-WHERE conf.id IN (SELECT id FROM all_ids);
+SELECT * FROM olap_orchestration.job_config conf
+WHERE conf.id IN (SELECT id FROM all_ids)
+  AND ('All' IN ($layer) OR conf.layer IN ($layer));
 ```
 
 **Ý nghĩa**: 
@@ -847,7 +1040,7 @@ SELECT
             ELSE '[]'::jsonb 
         END
     ) as dependency_count
-FROM olap_dev.job_config
+FROM olap_orchestration.job_config
 ORDER BY dependency_count DESC;
 ```
 
@@ -856,7 +1049,7 @@ ORDER BY dependency_count DESC;
 -- Jobs không có dependencies và không là dependency của others
 WITH all_dependencies AS (
     SELECT DISTINCT elem as job_id
-    FROM olap_dev.job_config jc
+    FROM olap_orchestration.job_config jc
     LEFT JOIN LATERAL jsonb_array_elements_text(
         CASE 
             WHEN jsonb_typeof(jc.depend_ons) = 'array'
@@ -866,7 +1059,7 @@ WITH all_dependencies AS (
     ) AS elem ON TRUE
 )
 SELECT jc.id
-FROM olap_dev.job_config jc
+FROM olap_orchestration.job_config jc
 WHERE (
     jc.depend_ons IS NULL 
     OR jsonb_array_length(jc.depend_ons) = 0
@@ -884,7 +1077,7 @@ WITH RECURSIVE dep_chain AS (
         depend_ons,
         1 as depth,
         ARRAY[id] as path
-    FROM olap_dev.job_config
+    FROM olap_orchestration.job_config
     
     UNION ALL
     
@@ -895,7 +1088,7 @@ WITH RECURSIVE dep_chain AS (
         dc.depth + 1,
         dc.path || jc.id
     FROM dep_chain dc
-    JOIN olap_dev.job_config jc 
+    JOIN olap_orchestration.job_config jc 
         ON dc.depend_ons ? jc.id
     WHERE dc.depth < 10
       AND NOT (jc.id = ANY(dc.path))
@@ -916,7 +1109,7 @@ SELECT
     cron_expression,
     COUNT(*) as job_count,
     string_agg(id, ', ') as jobs
-FROM olap_dev.job_config
+FROM olap_orchestration.job_config
 WHERE cron_expression IS NOT NULL
 GROUP BY cron_expression
 ORDER BY job_count DESC;
@@ -929,7 +1122,7 @@ SELECT
     SUM(threads) as total_threads,
     AVG(timeout) as avg_timeout,
     COUNT(*) as total_jobs
-FROM olap_dev.job_config
+FROM olap_orchestration.job_config
 WHERE schedule_type = 'cron';
 ```
 
@@ -947,13 +1140,13 @@ WHERE schedule_type = 'cron';
 
 ## Database Schema
 
-### Table: olap_dev.job_config
+### Table: olap_orchestration.job_config
 
 **Purpose**: Store DBT job configurations và dependencies
 
 **Key Columns**:
 ```sql
-CREATE TABLE olap_dev.job_config (
+CREATE TABLE olap_orchestration.job_config (
     id VARCHAR PRIMARY KEY,
     name VARCHAR,
     description TEXT,
@@ -979,23 +1172,23 @@ CREATE TABLE olap_dev.job_config (
 **Indexes**:
 ```sql
 -- For dependency queries
-CREATE INDEX idx_job_config_depend_ons ON olap_dev.job_config USING GIN (depend_ons);
+CREATE INDEX idx_job_config_depend_ons ON olap_orchestration.job_config USING GIN (depend_ons);
 
 -- For schedule queries
-CREATE INDEX idx_job_config_cron ON olap_dev.job_config (cron_expression);
+CREATE INDEX idx_job_config_cron ON olap_orchestration.job_config (cron_expression);
 ```
 
 ---
 
-### Table: olap_dev.execution_log
+### Table: olap_orchestration.execution_log
 
 **Purpose**: Track DBT job execution history và results
 
 **Key Columns**:
 ```sql
-CREATE TABLE olap_dev.execution_log (
+CREATE TABLE olap_orchestration.execution_log (
     execution_id VARCHAR PRIMARY KEY,
-    job_id VARCHAR REFERENCES olap_dev.job_config(id),
+    job_id VARCHAR REFERENCES olap_orchestration.job_config(id),
     data_date DATE,
     status VARCHAR,
     detail_status VARCHAR,
@@ -1026,27 +1219,27 @@ CREATE TABLE olap_dev.execution_log (
 **Indexes**:
 ```sql
 -- For date-based queries
-CREATE INDEX idx_execution_log_data_date ON olap_dev.execution_log (data_date);
+CREATE INDEX idx_execution_log_data_date ON olap_orchestration.execution_log (data_date);
 
 -- For status queries
-CREATE INDEX idx_execution_log_status ON olap_dev.execution_log (status);
+CREATE INDEX idx_execution_log_status ON olap_orchestration.execution_log (status);
 
 -- For job lookup
-CREATE INDEX idx_execution_log_job_id ON olap_dev.execution_log (job_id);
+CREATE INDEX idx_execution_log_job_id ON olap_orchestration.execution_log (job_id);
 
 -- Composite for common filters
-CREATE INDEX idx_execution_log_job_date ON olap_dev.execution_log (job_id, data_date);
+CREATE INDEX idx_execution_log_job_date ON olap_orchestration.execution_log (job_id, data_date);
 ```
 
 ---
 
-### Table: olap_dev.glue_catalog_ingestion_tracking
+### Table: olap_orchestration.glue_catalog_ingestion_tracking
 
 **Purpose**: Track Raw job (Glue Catalog ingestion) execution history
 
 **Key Columns**:
 ```sql
-CREATE TABLE olap_dev.glue_catalog_ingestion_tracking (
+CREATE TABLE olap_orchestration.glue_catalog_ingestion_tracking (
     id SERIAL PRIMARY KEY,
     data_source_name VARCHAR,  -- Raw job identifier
     data_date DATE,
@@ -1070,17 +1263,17 @@ CREATE TABLE olap_dev.glue_catalog_ingestion_tracking (
 **Indexes**:
 ```sql
 -- For date-based queries
-CREATE INDEX idx_glue_tracking_data_date ON olap_dev.glue_catalog_ingestion_tracking (data_date);
+CREATE INDEX idx_glue_tracking_data_date ON olap_orchestration.glue_catalog_ingestion_tracking (data_date);
 
 -- For source lookup
-CREATE INDEX idx_glue_tracking_source ON olap_dev.glue_catalog_ingestion_tracking (data_source_name);
+CREATE INDEX idx_glue_tracking_source ON olap_orchestration.glue_catalog_ingestion_tracking (data_source_name);
 
 -- For status queries
-CREATE INDEX idx_glue_tracking_status ON olap_dev.glue_catalog_ingestion_tracking (status);
+CREATE INDEX idx_glue_tracking_status ON olap_orchestration.glue_catalog_ingestion_tracking (status);
 
 -- Composite for common filters
 CREATE INDEX idx_glue_tracking_source_date 
-ON olap_dev.glue_catalog_ingestion_tracking (data_source_name, data_date);
+ON olap_orchestration.glue_catalog_ingestion_tracking (data_source_name, data_date);
 ```
 
 ---
@@ -1095,14 +1288,14 @@ Dashboard sử dụng **Recursive CTEs** để traverse dependency graph. Đây 
 WITH RECURSIVE downstream AS (
     -- Base case: Root job(s)
     SELECT id, 0 AS level
-    FROM olap_dev.job_config
+    FROM olap_orchestration.job_config
     WHERE id IN ($job_id)
     
     UNION ALL
     
     -- Recursive case: Find children
     SELECT c.id, d.level + 1 AS level
-    FROM olap_dev.job_config c
+    FROM olap_orchestration.job_config c
     JOIN downstream d 
         ON c.depend_ons ? d.id  -- JSONB contains operator
     WHERE d.level < $level
@@ -1132,14 +1325,14 @@ Selected: job_B (level 0)
 WITH RECURSIVE upstream AS (
     -- Base case: Root job(s)
     SELECT id, depend_ons, 0 AS level
-    FROM olap_dev.job_config
+    FROM olap_orchestration.job_config
     WHERE id IN ($job_id)
     
     UNION ALL
     
     -- Recursive case: Find parents
     SELECT c.id, c.depend_ons, u.level + 1 AS level
-    FROM olap_dev.job_config c
+    FROM olap_orchestration.job_config c
     JOIN upstream u 
         ON u.depend_ons ? c.id  -- Current job in upstream's dependencies
     WHERE u.level < $level
@@ -1173,7 +1366,7 @@ all_ids AS (
     UNION
     SELECT id FROM upstream WHERE level <= $level
 )
-SELECT * FROM olap_dev.job_config
+SELECT * FROM olap_orchestration.job_config
 WHERE id IN (SELECT id FROM all_ids);
 ```
 
@@ -1193,7 +1386,7 @@ SELECT
     COUNT(*) FILTER (WHERE status = 'FAILED') as failed,
     COUNT(*) FILTER (WHERE status IN ('RUNNING', 'PENDING', 'QUEUE')) as in_progress,
     ROUND(100.0 * COUNT(*) FILTER (WHERE status = 'Completed') / COUNT(*), 2) as success_rate
-FROM olap_dev.execution_log
+FROM olap_orchestration.execution_log
 WHERE data_date = CURRENT_DATE - 1;
 ```
 
@@ -1212,7 +1405,7 @@ WHERE data_date = CURRENT_DATE - 1;
 ```sql
 -- Critical job failures
 SELECT job_id, error_message, start_time
-FROM olap_dev.execution_log
+FROM olap_orchestration.execution_log
 WHERE status = 'FAILED'
   AND job_id IN (
       -- List of critical jobs
@@ -1229,7 +1422,7 @@ WITH avg_duration AS (
         job_id,
         AVG(duration) as avg_dur,
         STDDEV(duration) as stddev_dur
-    FROM olap_dev.execution_log
+    FROM olap_orchestration.execution_log
     WHERE status = 'Completed'
       AND data_date >= CURRENT_DATE - 30
     GROUP BY job_id
@@ -1239,7 +1432,7 @@ SELECT
     log.duration,
     ad.avg_dur,
     log.duration - ad.avg_dur as deviation
-FROM olap_dev.execution_log log
+FROM olap_orchestration.execution_log log
 JOIN avg_duration ad ON log.job_id = ad.job_id
 WHERE log.data_date = CURRENT_DATE
   AND log.status IN ('Completed', 'RUNNING')
@@ -1250,7 +1443,7 @@ WHERE log.data_date = CURRENT_DATE
 ```sql
 -- High retry count
 SELECT job_id, retry, max_retry, error_message
-FROM olap_dev.execution_log
+FROM olap_orchestration.execution_log
 WHERE data_date = CURRENT_DATE
   AND retry > 0
 ORDER BY retry DESC;
@@ -1329,13 +1522,13 @@ def send_slack_alert(job_id, status, error_message):
 ```sql
 -- Check if job is scheduled
 SELECT id, cron_expression, schedule_type
-FROM olap_dev.job_config
+FROM olap_orchestration.job_config
 WHERE id = 'your_job_id';
 
 -- Check dependency status
 WITH job_deps AS (
     SELECT jsonb_array_elements_text(depend_ons) as dep_id
-    FROM olap_dev.job_config
+    FROM olap_orchestration.job_config
     WHERE id = 'your_job_id'
 )
 SELECT 
@@ -1343,7 +1536,7 @@ SELECT
     log.status,
     log.end_time
 FROM job_deps jd
-LEFT JOIN olap_dev.execution_log log 
+LEFT JOIN olap_orchestration.execution_log log 
     ON jd.dep_id = log.job_id 
     AND log.data_date = CURRENT_DATE
 ORDER BY log.end_time DESC;
@@ -1386,7 +1579,7 @@ SELECT
     start_time,
     NOW() - start_time as pending_duration,
     dependency_status
-FROM olap_dev.execution_log
+FROM olap_orchestration.execution_log
 WHERE status = 'PENDING'
   AND data_date = CURRENT_DATE
 ORDER BY start_time;
@@ -1401,7 +1594,7 @@ ORDER BY start_time;
        log.job_id,
        log.depend_ons,
        log.dependency_status
-   FROM olap_dev.execution_log log
+   FROM olap_orchestration.execution_log log
    WHERE log.status = 'PENDING'
      AND log.data_date = CURRENT_DATE;
    ```
@@ -1417,7 +1610,7 @@ ORDER BY start_time;
    ```sql
    -- Count jobs in queue
    SELECT COUNT(*) as queue_depth
-   FROM olap_dev.execution_log
+   FROM olap_orchestration.execution_log
    WHERE status IN ('PENDING', 'QUEUE')
      AND data_date = CURRENT_DATE;
    ```
@@ -1444,7 +1637,7 @@ SELECT
     duration,
     execution_steps,
     test_results
-FROM olap_dev.execution_log
+FROM olap_orchestration.execution_log
 WHERE status = 'FAILED'
   AND data_date = CURRENT_DATE
 ORDER BY start_time DESC;
@@ -1459,7 +1652,7 @@ ORDER BY start_time DESC;
        job_id,
        test_status,
        test_results
-   FROM olap_dev.execution_log
+   FROM olap_orchestration.execution_log
    WHERE test_status = 'FAILED'
      AND data_date = CURRENT_DATE;
    ```
@@ -1488,8 +1681,8 @@ ORDER BY start_time DESC;
            WHEN duration >= timeout THEN 'Timeout likely'
            ELSE 'Other failure'
        END as failure_reason
-   FROM olap_dev.execution_log log
-   JOIN olap_dev.job_config conf ON log.job_id = conf.id
+   FROM olap_orchestration.execution_log log
+   JOIN olap_orchestration.job_config conf ON log.job_id = conf.id
    WHERE log.status = 'FAILED'
      AND log.data_date = CURRENT_DATE;
    ```
@@ -1518,7 +1711,7 @@ WITH historical AS (
         STDDEV(duration) as stddev_duration,
         MIN(duration) as min_duration,
         MAX(duration) as max_duration
-    FROM olap_dev.execution_log
+    FROM olap_orchestration.execution_log
     WHERE status = 'Completed'
       AND data_date >= CURRENT_DATE - 30
     GROUP BY job_id
@@ -1530,7 +1723,7 @@ SELECT
     h.min_duration,
     h.max_duration,
     ROUND((log.duration - h.avg_duration) / h.avg_duration * 100, 2) as pct_deviation
-FROM olap_dev.execution_log log
+FROM olap_orchestration.execution_log log
 JOIN historical h ON log.job_id = h.job_id
 WHERE log.data_date = CURRENT_DATE
   AND log.duration > h.avg_duration * 1.5
@@ -1547,7 +1740,7 @@ ORDER BY pct_deviation DESC;
 2. **Increase parallelization**:
    ```sql
    -- Update threads in config
-   UPDATE olap_dev.job_config
+   UPDATE olap_orchestration.job_config
    SET threads = 8
    WHERE id = 'slow_job_id';
    ```
@@ -1565,7 +1758,7 @@ ORDER BY pct_deviation DESC;
        data_date,
        records_processed,
        bytes_processed
-   FROM olap_dev.glue_catalog_ingestion_tracking
+   FROM olap_orchestration.glue_catalog_ingestion_tracking
    WHERE data_date >= CURRENT_DATE - 7
    ORDER BY data_date DESC, records_processed DESC;
    ```
@@ -1586,7 +1779,7 @@ WITH RECURSIVE dep_chain AS (
         depend_ons,
         1 as depth,
         ARRAY[id] as path
-    FROM olap_dev.job_config
+    FROM olap_orchestration.job_config
     
     UNION ALL
     
@@ -1597,7 +1790,7 @@ WITH RECURSIVE dep_chain AS (
         dc.depth + 1,
         dc.path || jsonb_array_elements_text(dc.depend_ons)::text
     FROM dep_chain dc
-    JOIN olap_dev.job_config jc 
+    JOIN olap_orchestration.job_config jc 
         ON jc.id = jsonb_array_elements_text(dc.depend_ons)::text
     WHERE dc.depth < 20
       AND NOT (jsonb_array_elements_text(dc.depend_ons)::text = ANY(dc.path))
@@ -1628,18 +1821,18 @@ WHERE current_job = root_job
 ```sql
 -- Add indexes for faster lookups
 CREATE INDEX IF NOT EXISTS idx_job_config_id 
-ON olap_dev.job_config (id);
+ON olap_orchestration.job_config (id);
 
 CREATE INDEX IF NOT EXISTS idx_execution_log_job_date_status 
-ON olap_dev.execution_log (job_id, data_date, status);
+ON olap_orchestration.execution_log (job_id, data_date, status);
 
 CREATE INDEX IF NOT EXISTS idx_glue_tracking_source_date_status
-ON olap_dev.glue_catalog_ingestion_tracking (data_source_name, data_date, status);
+ON olap_orchestration.glue_catalog_ingestion_tracking (data_source_name, data_date, status);
 ```
 
 **Materialized View for Job Statistics**:
 ```sql
-CREATE MATERIALIZED VIEW olap_dev.mv_daily_job_stats AS
+CREATE MATERIALIZED VIEW olap_orchestration.mv_daily_job_stats AS
 SELECT 
     data_date,
     COUNT(*) as total_jobs,
@@ -1647,11 +1840,11 @@ SELECT
     COUNT(*) FILTER (WHERE status = 'FAILED') as failed_jobs,
     AVG(duration) as avg_duration,
     MAX(duration) as max_duration
-FROM olap_dev.execution_log
+FROM olap_orchestration.execution_log
 GROUP BY data_date;
 
 -- Refresh daily
-REFRESH MATERIALIZED VIEW olap_dev.mv_daily_job_stats;
+REFRESH MATERIALIZED VIEW olap_orchestration.mv_daily_job_stats;
 ```
 
 ---
@@ -1667,18 +1860,18 @@ REFRESH MATERIALIZED VIEW olap_dev.mv_daily_job_stats;
 **Query Caching**:
 ```sql
 -- Cache frequently accessed data
-CREATE TABLE olap_dev.cache_job_dependencies AS
+CREATE TABLE olap_orchestration.cache_job_dependencies AS
 SELECT 
     parent.id as parent_job,
     child.id as child_job,
     1 as depth
-FROM olap_dev.job_config parent
-CROSS JOIN olap_dev.job_config child
+FROM olap_orchestration.job_config parent
+CROSS JOIN olap_orchestration.job_config child
 WHERE child.depend_ons ? parent.id;
 
 -- Refresh cache periodically
-TRUNCATE olap_dev.cache_job_dependencies;
-INSERT INTO olap_dev.cache_job_dependencies 
+TRUNCATE olap_orchestration.cache_job_dependencies;
+INSERT INTO olap_orchestration.cache_job_dependencies 
 SELECT ...;
 ```
 
@@ -1689,27 +1882,27 @@ SELECT ...;
 **Regular Maintenance Tasks**:
 ```sql
 -- Vacuum and analyze tables
-VACUUM ANALYZE olap_dev.job_config;
-VACUUM ANALYZE olap_dev.execution_log;
-VACUUM ANALYZE olap_dev.glue_catalog_ingestion_tracking;
+VACUUM ANALYZE olap_orchestration.job_config;
+VACUUM ANALYZE olap_orchestration.execution_log;
+VACUUM ANALYZE olap_orchestration.glue_catalog_ingestion_tracking;
 
 -- Update statistics
-ANALYZE olap_dev.job_config;
-ANALYZE olap_dev.execution_log;
+ANALYZE olap_orchestration.job_config;
+ANALYZE olap_orchestration.execution_log;
 
 -- Reindex periodically
-REINDEX TABLE olap_dev.job_config;
-REINDEX TABLE olap_dev.execution_log;
+REINDEX TABLE olap_orchestration.job_config;
+REINDEX TABLE olap_orchestration.execution_log;
 ```
 
 **Archive Old Data**:
 ```sql
 -- Archive logs older than retention period
-INSERT INTO olap_dev.execution_log_archive
-SELECT * FROM olap_dev.execution_log
+INSERT INTO olap_orchestration.execution_log_archive
+SELECT * FROM olap_orchestration.execution_log
 WHERE data_date < CURRENT_DATE - INTERVAL '90 days';
 
-DELETE FROM olap_dev.execution_log
+DELETE FROM olap_orchestration.execution_log
 WHERE data_date < CURRENT_DATE - INTERVAL '90 days';
 ```
 
@@ -1738,13 +1931,13 @@ mart_<business_area>          - Business marts
 **Resource Allocation**:
 ```sql
 -- Set appropriate timeouts based on historical data
-UPDATE olap_dev.job_config
+UPDATE olap_orchestration.job_config
 SET timeout = CEIL(avg_duration * 2)
 FROM (
     SELECT 
         job_id,
         AVG(duration) as avg_duration
-    FROM olap_dev.execution_log
+    FROM olap_orchestration.execution_log
     WHERE status = 'Completed'
       AND data_date >= CURRENT_DATE - 30
     GROUP BY job_id
@@ -1869,13 +2062,13 @@ from airflow.operators.postgres_operator import PostgresOperator
 # Check dependencies before running
 check_dependencies = PostgresOperator(
     task_id='check_dependencies',
-    postgres_conn_id='olap_dev',
+    postgres_conn_id='olap_orchestration',
     sql="""
         SELECT COUNT(*) as pending_deps
-        FROM olap_dev.execution_log
+        FROM olap_orchestration.execution_log
         WHERE job_id IN (
             SELECT jsonb_array_elements_text(depend_ons)
-            FROM olap_dev.job_config
+            FROM olap_orchestration.job_config
             WHERE id = '{{ params.job_id }}'
         )
         AND data_date = '{{ ds }}'
